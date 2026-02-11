@@ -1,12 +1,64 @@
-using Images, FileIO, Plots, FFTW, Statistics
+using Images, FileIO, Plots, FFTW, Statistics, ImageFiltering
 gr()
 
-const wavelength = 632e-9
-const dx_pixel_size = 3.45e-6
+const wavelength = 633e-9
+const dx_pixel_size = 5.807e-6
 const distance = 0.1
 const dy_pixel_size = dx_pixel_size
 const λ = wavelength
 const z = distance
+
+# ============================================
+# Helper Function: Spherical & Tilt Compensation (2nd-Order Fit)
+# ============================================
+function remove_spherical_aberration(img)
+    rows, cols = size(img)
+    X = repeat(1:cols, 1, rows)'
+    Y = repeat(1:rows, 1, cols)
+    
+    # 2nd-order Polynomial: z = c1*x^2 + c2*y^2 + c3*xy + c4*x + c5*y + c6
+    X1 = reshape(X, :)
+    Y1 = reshape(Y, :)
+    A = [X1.^2  Y1.^2  X1.*Y1  X1  Y1  ones(length(X1))]
+    b = reshape(img, :)
+    
+    coeffs = A \ b
+    
+    background = coeffs[1] .* X.^2 .+ coeffs[2] .* Y.^2 .+ coeffs[3] .* (X .* Y) .+ 
+        coeffs[4] .* X .+ coeffs[5] .* Y .+ coeffs[6]
+    return img .- background
+end
+
+# ============================================
+# Helper Function: Auto-Focus (Sharpness Metric)
+# ============================================
+function auto_focus(U_field, H_template, fx_grid, fy_grid, z_range;
+    dx=dx_pixel_size, wl=wavelength)
+    k = 2π / wl
+    A_0 = fftshift(fft(U_field))
+
+    best_z = z_range[1]
+    best_score = -Inf
+
+    for z_try in z_range
+        root = Complex.(1 .- (wl .* fx_grid).^2 .- (wl .* fy_grid).^2)
+        H_try = exp.(1im .* k .* z_try .* sqrt.(root))
+        H_try[real.(root) .< 0] .= 0
+
+        U_try = ifft(ifftshift(A_0 .* H_try))
+        amp = abs.(U_try)
+
+        # Focus Metric: Normalised Variance (สูง = คมชัด)
+        μ = mean(amp)
+        score = var(amp) / (μ^2 + 1e-30)
+
+        if score > best_score
+            best_score = score
+            best_z = z_try
+        end
+    end
+    return best_z, best_score
+end
 
 println("=== System Configuration ===")
 println("Wavelength: $(wavelength * 1e9) nm")
@@ -31,10 +83,17 @@ if isfile(img_path)
     # Plot Raw Hologram
     p1 = heatmap(u_hologram, 
         title = "Raw Hologram",
-        color = :gray,
+        color = :viridis,
         aspect_ratio = :equal,
         axis = nothing
     )
+
+    plt_1 = plot(p1, layout=(1, 1), size=(1000, 600))
+    savefig(plt_1, "Raw Hologram.png")
+
+    # display(plt_1)
+    # println("\nDone! Press Enter to exit...")
+    # readline()
     
     println("\n=== step 2: FFT & Spectral Analysis ===")
     # --- FFT & Spectral Analysis ---
@@ -55,6 +114,13 @@ if isfile(img_path)
     cx, cy = w/2 +1, h/2 +1
     plot!(p2, [cx], [cy], seriestype=:scatter, color=:red, label="DC Center", markersize=5)
 
+    plt_2 = plot(p2, layout=(1, 1), size=(1000, 600))
+    savefig(plt_2, "Frequency Spectrum (Log).png")
+
+    # display(plt_2)
+    # println("\nDone! Press Enter to exit...")
+    # readline()
+
     # === Spaatial Filtering ===
     cxx , cyy = Int(w/2), Int(h/2)
     search_spectrum = copy(spectrum_mag)
@@ -72,17 +138,15 @@ if isfile(img_path)
     peak_y,  peak_x = max_idx[1], max_idx[2]
     println("Found Sideband Peak at: x=$peak_x y=$peak_y")
 
-    # creat image Circular filter Mask
-    filter_redius = 150 # <--- ขนาดรูรับแสง (ถ้าภาพเบลอให้ปรับค่านี้)
+    # creat Gaussian Soft-Edge Mask (ขอบนุ่ม ลด Ringing Artifact)
+    filter_redius = 20 # <--- ขนาดรูรับแสง (ถ้าภาพเบลอให้ปรับค่านี้)
     mask = zeros(ComplexF64, h, w)    
     
     for i in 1:h, j in 1:w
         dist = sqrt((i - peak_y)^2 + (j - peak_x)^2)
 
-        # ให้เก็บค่าความถี่ไว้ ถ้าอยู่ในวง
-        if dist < filter_redius
-            mask[i, j] = 1.0
-        end
+        # Gaussian window: ค่อยๆ จางลงที่ขอบ แทนการตัดแบบคมชัด
+        mask[i, j] = exp(-dist^2 / (2 * filter_redius^2))
     end
 
     # cute and moive to Center
@@ -97,16 +161,23 @@ if isfile(img_path)
     p3 = heatmap(
         log.(abs.(F_filtered) .+ 1),
         c=:viridis,
-        title="Filtered sidedand",
+        title="Filtered Sideband",
         axis=nothing
     )
 
     p4 = heatmap(
         log.(abs.(F_centered) .+ 1),
         c=:viridis,
-        title="Filtered sidedand",
+        title="Centered Sideband",
         axis=nothing
     )
+
+    plt_3 = plot(p3, p4, layout=(1, 2), size=(1000, 600))
+    savefig(plt_3, "Filtered sidedand.png")
+
+    # display(plt_3)
+    # println("\nDone! Press Enter to exit...")
+    # readline() 
     
     println("\n=== step 3: ASM Propagation ===")
     # Creat Frequency Coordinates and Creat asxis Frequency fx, fy ให้ตรงกับภาพ
@@ -118,12 +189,19 @@ if isfile(img_path)
     FX = repeat(reshape(fx, 1, :), M, 1)
     FY = repeat(reshape(fy, :, 1), 1, N)
 
-    # Creat Transfer Function (H)
+    # ======== Image Plane Holography Mode ========
+    println("\n--- Image Plane Reconstruction ---")
+    # เลนส์ 35mm ทำหน้าที่สร้างภาพแล้ว ระยะแพร่คลื่น (z) จึงต้องใกล้ 0
+    # ใช้ค่า z เล็กน้อยมากเพื่อชดเชย Defocus (0.0 cm ถึง 0.5 cm)
+    z_best = 0.00  # <--- ตั้งเป็นศูนย์ หรือปรับแค่ 0.001 - 0.005 ถ้ากล้องโฟกัสคลาดเคลื่อน
+    println("Using z = $(round(z_best*100, digits=2)) cm (Image Plane mode, 35mm lens)")
+
+    # Creat Transfer Function (H) ด้วย z_best
     k = 2 * π / λ
     root_term = Complex.(1 .- (λ .* FX).^2 .- (λ .* FY).^2)
 
     # สร้างแผ่นกรองแสง H
-    H = exp.(1im .* k .* z .* sqrt.(root_term))
+    H = exp.(1im .* k .* z_best .* sqrt.(root_term))
     # ตัดคลื่น Evanescent (คลื่นที่เดินทางไม่ได้) ทิ้งไป เพื่อลด Noise
     H[real.(root_term) .< 0] .= 0
 
@@ -134,13 +212,19 @@ if isfile(img_path)
     # แปลงกลับเป็นภาพ (Inverse FFT)
     U_recon = ifft(ifftshift(A_z))
 
-    # แยกข้อมูล Amplitude และ Phase
-    amp_img = abs.(U_recon) # ความสว่าง (ไว้ดูความชัด)
-    phase_img = angle.(U_recon) # เฟส (ไว้คำนวณความลึก)
+    # Gaussian Smoothing เพื่อลด Phase Noise (σ=5.0)
+    println("Applying Gaussian smoothing (σ=5.0)...")
+    U_recon_smooth = imfilter(U_recon, Kernel.gaussian(5.0))
 
-    p5 = heatmap(amp_img,
-        c=:gray,
-        title="Reconstructed Amplitude (z=$(z*100) cm)",
+    # Amplitude จาก Raw (ไว้ดูโฟกัส) และ Phase จาก Smoothed (ไว้คำนวณความลึก)
+    amp_img = abs.(U_recon)            # ความสว่างจาก Raw field
+    phase_img = angle.(U_recon_smooth) # เฟสจาก Smoothed field
+
+    # Log-scale + viridis เพื่อเพิ่ม Contrast (แก้ภาพสีเทาว่างเปล่า)
+    amp_log = log.(amp_img .+ 1e-10)
+    p5 = heatmap(amp_log,
+        c=:viridis,
+        title="Reconstructed Amplitude (z=$(round(z_best*100, digits=3)) cm)",
         aspect_ratio=:equal,
         axis=nothing
     )
@@ -151,6 +235,13 @@ if isfile(img_path)
         aspect_ratio=:equal,
         axis=nothing
     )
+
+    plt_4 = plot(p5, p6, layout=(1, 2), size=(1000, 600))
+    savefig(plt_4, "Reconstructed Amplitude and  Phase.png")
+
+    # display(plt_4)
+    # println("\nDone! Press Enter to exit...")
+    # readline() 
 
     println("\n=== Step 4 & 5: Unwrap & Scaling ===")
     function unwrap_1d(phase_vec)
@@ -193,11 +284,21 @@ if isfile(img_path)
     println("Unwrapping Phase (Simple 2D)...")
     phi_unwrapped = unwrap_2d_simple(phase_img)
 
+    # Spherical Aberration Compensation: ลบความโค้งของเลนส์ (2nd-Order Fit)
+    println("Applying Spherical Aberration Compensation...")
+    phi_flat = remove_spherical_aberration(phi_unwrapped)
+
     # Scaling: แปลง Phase (rad) -> Height (nm)
-    height_map_nm = (phi_unwrapped .* wavelength) ./ (4 * π) .* 1e9
+    height_map_nm = (phi_flat .* wavelength) ./ (4 * π) .* 1e9
+
+    # Median Filter : กำจัดจุดกระโดด (Spikes) บน Height Map
+    println("Applying Median Filter (11×11) on height map...")
+    height_map_nm = mapwindow(median, height_map_nm, (11, 11))
+
+    println("\nFocused at z = $(round(z_best*100, digits=3)) cm")
     
-    # ปรับระดับพื้นผิวให้เริ่มที่ 0 (Subtract Mean/Min)
-    height_map_nm .-= mean(height_map_nm)
+    # ปรับระดับพื้นผิวให้เริ่มที่ 0 (ใช้ median เพื่อความเสถียร)
+    height_map_nm .-= median(height_map_nm)
 
     # กลับทิศ (Optional): ถ้ารอยขีดข่วนมันนูนขึ้นแทนที่จะบุ๋มลง ให้แก้เครื่องหมาย
     # height_map_nm = -height_map_nm
@@ -211,7 +312,8 @@ if isfile(img_path)
     
     p_final = surface(h_small,
         title = "Reconstructed 3D Surface Defect",
-        camera = (45, 30),
+        camera = (30, 45),
+        shading = :flat,
         c = :viridis,
         zlabel = "Height (nm)",
         xlabel = "X", ylabel = "Y",
